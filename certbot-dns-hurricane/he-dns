@@ -1,0 +1,257 @@
+#!/bin/bash
+
+usage()
+{
+	cat <<EOF >&2
+Usage: $0 arguments...
+
+Required arguments:
+
+    -a/--action        Action to take: "create", "update" or "delete"
+    -d/--domain        Name of the domain to edit
+    -u/--username      dns.he.net username
+    -p/--password      dns.he.net password
+    -t/--type          Record type: "A", "AAAA", "CNAME", "TXT", "MX",
+                       "SSHFP", "CAA" and some others may be supported.
+    -n/--name          Record name, without the domain name portion
+
+Optional arguments:
+
+    -l/--ttl           Time to live in seconds; defaults to 1 hour (3600)
+	-m/--match         Value of the old record - optional for "update" and
+	                   "delete" operations to aid in matching a previously
+					   created record.
+    -v/--value         Principal value of the record - required for
+                       "create" and "update" actions
+    -p/--priority      Priority - required for MX and SRV record types
+
+EOF
+	exit 1
+}
+
+record_ttl=3600
+match_value=
+
+while [ -n "$1" ]; do
+	case "$1" in
+		-d|--domain)
+			shift; domain="$1" ;;
+		-u|--username)
+			shift; user="$1" ;;
+		-p|--password)
+			shift; password="$1" ;;
+		-a|--action)
+			shift; action="$1" ;;
+		-t|--type)
+			shift; record_type="$1" ;;
+		-l|--ttl)
+			shift; record_ttl="$1" ;;
+		-n|--name)
+			shift; record_name="$1" ;;
+		-v|--value)
+			shift; record_value="$1" ;;
+		-m|--match)
+			shift; match_value="$1" ;;
+		-p|--priority)
+			shift; record_priority="$1" ;;
+		--domain=*)
+			domain="${1:9}" ;;
+		--username=*)
+			user="${1:11}" ;;
+		--password=*)
+			password="${1:11}" ;;
+		--action=*)
+			action="${1:9}" ;;
+		--type=*)
+			record_type="${1:7}" ;;
+		--ttl=*)
+			record_ttl="${1:6}" ;;
+		--name=*)
+			record_name="${1:7}" ;;
+		--value=*)
+			record_value="${1:8}" ;;
+		--match=*)
+			match_value="${1:8}" ;;
+		--priority=*)
+			record_priority="${1:11}" ;;
+	esac
+	shift
+done
+
+log() {
+	echo "$1" >&2
+}
+
+isolate() {
+	egrep -o "$1" "$2" | head -1 | sed -re "s;$1;\\1;"
+}
+
+find_record() {
+	local zone_id="$1"
+	local record_type="$2"
+	local record_name="$3"
+	local record_value="$4"
+
+	echo "[+] Attempting to find record: ${record_type} ${record_name}" >&2
+
+	path=/tmp/he-dns-findrecord.$$.$RANDOM
+	curl "https://dns.he.net/?menu=edit_zone&hosted_dns_editzone&hosted_dns_zoneid=${zone_id}" -s --compressed --output - --cookie "${cookie_jar}" |  fgrep -B1 -A4 'class="dns_view">'${record_name}'</td>' > $path
+	i=0
+	while true; do
+		tail -n+$i $path | head -6 > $path.tmp
+		read_record_id=$(isolate '^\s*<td class="hidden">([0-9]+)</td>$' $path.tmp)
+		read_record_type=$(isolate '^\s*<td align="center" ><span class="rrlabel [A-Z]+*" data="([A-Z]+)" ' $path.tmp)
+		read_record_value=$(isolate '<td align="left" data="([^"]+)"[ >]' $path.tmp)
+		read_record_value=${read_record_value//&quot;/}
+
+		rm $path.tmp
+		
+		if [ -z "$read_record_id" ]; then
+			break
+		fi
+
+		if [ "$read_record_type" = "$record_type" ]; then
+			if [ -z "$record_value" -o "$read_record_value" = "$record_value" ]; then
+				record_id="$read_record_id"
+				break
+			fi
+		fi
+		i=$(($i + 8))
+	done
+	rm -f $path
+
+	if [ -n "$record_id" ]; then
+		echo "$record_id"
+		return 0
+	fi
+	return 1
+}
+
+# Ensure required parameters are supplied
+for param in domain user password action record_type record_name; do
+	[ -z "${!param}" ] && usage
+done
+
+# Check action and type
+if ! [[ $action =~ ^(create|update|delete|upsert)$ ]]; then
+	usage
+fi
+if ! [[ $record_type =~ ^(A|AAAA|SRV|MX|TXT|CNAME|SSHFP|CAA)$ ]]; then
+	usage
+fi
+
+# Log into HE
+cookie_jar=/tmp/cookies.$$.txt
+touch $cookie_jar
+trap "rm -f $cookie_jar" EXIT
+
+log "[>] Logging into dns.he.net"
+
+domain_escaped=${domain//\./\\.}
+curl https://dns.he.net/ -s --compressed --output /dev/null --cookie-jar "${cookie_jar}"
+curl https://dns.he.net/ -s --compressed --output - --cookie ${cookie_jar} -d "email=${user}&pass=${password}&submit=Login%21" | \
+	grep -o 'name="'${domain_escaped}'" value="[0-9]*"' | awk '{print $2;}' > /tmp/domain_id.$$.txt
+
+. /tmp/domain_id.$$.txt
+rm -f /tmp/domain_id.$$.txt
+if [ -z "${value}" ]; then
+	echo "Failed to determine the zone ID"
+	exit 1
+fi
+
+log "[+] Determined zone ID: ${value}"
+zone_id="${value}"
+
+# In upsert mode, decide whether to create or update a record based on whether
+# a prior one exists.
+if [ "$action" = "upsert" ]; then
+	record_id=$(find_record "$zone_id" "$record_type" "$record_name" "$record_value")
+	if [ -n "$record_id" ]; then
+		echo "[+] Record $record_type $record_name with value $record_value already exists."
+		echo "[+] Doing nothing."
+		exit 0
+	fi
+	
+	record_id=$(find_record "$zone_id" "$record_type" "$record_name" "")
+	if [ -n "$record_id" ]; then
+		echo "[+] Will update existing record: $record_id to $record_value"
+		action="update"
+	else
+		echo "[+] Will create new record"
+		action="create"
+	fi
+fi
+# In update/delete mode, we need to list contents of the zone and find the record ID.
+if [ "$action" = "update" -o "$action" = "delete" ]; then
+	record_id=$(find_record "$zone_id" "$record_type" "$record_name" "$match_value")
+	if [ $? -gt 0 ]; then
+		echo "[-] Unable to locate record: $record_type $record_name"
+		exit 1
+	fi
+	echo "[+] Found record ID: $record_id"
+
+	case "$action" in
+		update)
+			data="account="
+			data="${data}&menu=edit_zone"
+			data="${data}&Type=${record_type}"
+			data="${data}&hosted_dns_zoneid=${zone_id}"
+			data="${data}&hosted_dns_recordid=${record_id}"
+			data="${data}&hosted_dns_editzone=1"
+			data="${data}&Priority=-"
+			data="${data}&Name=${record_name}"
+			data="${data}&Content=${record_value}"
+			data="${data}&TTL=${record_ttl}"
+			data="${data}&hosted_dns_editrecord=Update"
+			echo "[+] Sending request to modify record: $record_type $record_name"
+			curl "https://dns.he.net/?menu=edit_zone&hosted_dns_editzone&hosted_dns_zoneid=${zone_id}" -s --compressed --output /dev/null --cookie "${cookie_jar}" -d "$data"
+			record_id=$(find_record "$zone_id" "$record_type" "$record_name" "$record_value")
+			if [ -n "$record_id" ]; then
+				echo "[+] Record $record_id updated ($record_type $record_name = $record_value)"
+				exit 0
+			fi
+			echo "[-] Record check failed - could not create record $record_type $record_name"
+			exit 1
+			;;
+		delete)
+			data="hosted_dns_zoneid=${zone_id}"
+			data="${data}&hosted_dns_recordid=${record_id}"
+			data="${data}&menu=edit_zone"
+			data="${data}&hosted_dns_delconfirm=delete"
+			data="${data}&hosted_dns_editzone=1"
+			data="${data}&hosted_dns_delrecord=1"
+			echo "[+] Sending request to delete record: $record_type $record_name (${match_value:-any value})"
+			curl https://dns.he.net/index.cgi -s --compressed --output /dev/null --cookie ${cookie_jar} -d "${data}"
+
+			# sleep 2
+			# check_record_id=$(find_record "$zone_id" "$record_type" "$record_name" "$match_value")
+			# if [ "$check_record_id" = "$record_id" ]; then
+			# 	echo "[-] Record ID $record_id is still present - could not delete"
+			# 	exit 1
+			# fi
+			echo "[+] Record $record_id deleted ($record_type $record_name)"
+			;;
+	esac
+elif [ "$action" = "create" ]; then
+	data="account="
+	data="${data}&menu=edit_zone"
+	data="${data}&Type=${record_type}"
+	data="${data}&hosted_dns_zoneid=${zone_id}"
+	data="${data}&hosted_dns_editzone=1"
+	data="${data}&Priority="
+	data="${data}&Name=${record_name}"
+	data="${data}&Content=${record_value}"
+	data="${data}&TTL=${record_ttl}"
+	data="${data}&hosted_dns_editrecord=Submit"
+
+	echo "[+] Sending request to create record: $record_type $record_name"
+	curl "https://dns.he.net/?menu=edit_zone&hosted_dns_editzone&hosted_dns_zoneid=${zone_id}" -s --compressed --output /dev/null --cookie "${cookie_jar}" -d "$data"
+	
+	record_id=$(find_record "$zone_id" "$record_type" "$record_name" "$record_value")
+	if [ -n "$record_id" ]; then
+		echo "[+] Record $record_id created ($record_type $record_name = $record_value)"
+		exit 0
+	fi
+	echo "[-] Record check failed - could not create record $record_type $record_name"
+	exit 1
+fi
