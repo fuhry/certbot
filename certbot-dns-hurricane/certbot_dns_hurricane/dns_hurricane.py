@@ -54,7 +54,7 @@ class Authenticator(dns_common.DNSAuthenticator):
         )
 
     def _perform(self, domain, validation_name, validation): # pylint: disable=missing-docstring
-        self._change_txt_record("upsert", domain, validation_name, validation)
+        self._change_txt_record("create", domain, validation_name, validation)
 
     def _cleanup(self, domain, validation_name, validation):
         self._change_txt_record("delete", domain, validation_name, validation)
@@ -64,7 +64,7 @@ class Authenticator(dns_common.DNSAuthenticator):
         domain = '%s.%s' % (tld.domain, tld.suffix)
         username = self.credentials.conf('username')
         password = self.credentials.conf('password')
-        cmdline = "/home/dan/bin/he-dns -d %s -u %s -p %s -a %s -t TXT -n %s -v %s" % (
+        cmdline = "he-dns -d %s -u %s -p %s -a %s -t TXT -n %s -v %s" % (
             domain, username, password, action, record_name, validation
         )
         result = os.system(cmdline)
